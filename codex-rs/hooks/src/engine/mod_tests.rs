@@ -332,12 +332,106 @@ async fn requirements_managed_hooks_execute_windows_command_override() {
     let expected_exit_code = if cfg!(windows) { 19 } else { 17 };
     assert_eq!(outcome.hook_events.len(), 1);
     assert_eq!(outcome.hook_events[0].run.status, HookRunStatus::Failed);
+    assert_error_contains(
+        &outcome.hook_events[0].run.entries,
+        &[
+            &format!("hook exited with code {expected_exit_code}"),
+            "hook_event: PreToolUse",
+            "hook_name_or_id:",
+            "config_source: LegacyManagedConfigMdm",
+            "command:",
+            &format!("exit_code: {expected_exit_code}"),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn multiple_matching_hooks_identify_the_one_that_failed() {
+    let temp = tempdir().expect("create temp dir");
+    let config_path =
+        AbsolutePathBuf::try_from(temp.path().join("config.toml")).expect("absolute config path");
+    let first_command = "import sys; sys.exit(0)";
+    let failing_command = "import sys; print('failed hook stderr', file=sys.stderr); sys.exit(1)";
+    let config: TomlValue = serde_json::from_value(serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "^Bash$",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": first_command,
+                        "statusMessage": "first hook",
+                    },
+                    {
+                        "type": "command",
+                        "command": failing_command,
+                        "statusMessage": "failing hook",
+                    },
+                ],
+            }],
+        },
+    }))
+    .expect("config TOML should deserialize");
+    let config_layer_stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::User {
+                file: config_path.clone(),
+                profile: None,
+            },
+            config,
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("config layer stack");
+    let engine = ClaudeHooksEngine::new(
+        /*enabled*/ true,
+        /*bypass_hook_trust*/ true,
+        Some(&config_layer_stack),
+        Vec::new(),
+        Vec::new(),
+        CommandShell {
+            program: "python3".to_string(),
+            args: vec!["-c".to_string()],
+        },
+    );
+
+    let outcome = engine
+        .run_pre_tool_use(PreToolUseRequest {
+            session_id: ThreadId::new(),
+            turn_id: "turn-1".to_string(),
+            subagent: None,
+            cwd: cwd(),
+            transcript_path: None,
+            model: "gpt-test".to_string(),
+            permission_mode: "default".to_string(),
+            tool_name: "Bash".to_string(),
+            matcher_aliases: Vec::new(),
+            tool_use_id: "tool-1".to_string(),
+            tool_input: serde_json::json!({ "command": "echo hello" }),
+        })
+        .await;
+
+    assert_eq!(outcome.hook_events.len(), 2);
+    assert_eq!(outcome.hook_events[0].run.status, HookRunStatus::Completed);
     assert_eq!(
         outcome.hook_events[0].run.entries,
-        vec![HookOutputEntry {
-            kind: HookOutputEntryKind::Error,
-            text: format!("hook exited with code {expected_exit_code}"),
-        }]
+        Vec::<HookOutputEntry>::new()
+    );
+    assert_eq!(outcome.hook_events[1].run.status, HookRunStatus::Failed);
+    assert_error_contains(
+        &outcome.hook_events[1].run.entries,
+        &[
+            "hook exited with code 1",
+            "hook_event: PreToolUse",
+            &format!("hook_name_or_id: pre-tool-use:1:{}", config_path.display()),
+            &format!("config_source: User {}", config_path.display()),
+            failing_command,
+            "status_message: failing hook",
+            "exit_code: 1",
+            "stderr_tail:",
+            "failed hook stderr",
+        ],
     );
 }
 
@@ -650,6 +744,18 @@ fn trusted_plugin_hook_stack(
         ConfigRequirementsToml::default(),
     )
     .expect("config layer stack")
+}
+
+fn assert_error_contains(entries: &[HookOutputEntry], expected: &[&str]) {
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].kind, HookOutputEntryKind::Error);
+    for text in expected {
+        assert!(
+            entries[0].text.contains(text),
+            "expected error text to contain {text:?}, got:\n{}",
+            entries[0].text
+        );
+    }
 }
 
 #[test]

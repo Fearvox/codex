@@ -183,10 +183,12 @@ fn parse_completed(
     match run_result.error.as_deref() {
         Some(error) => {
             status = HookRunStatus::Failed;
-            entries.push(HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: error.to_string(),
-            });
+            entries.push(common::diagnostic_error_entry(
+                handler,
+                &run_result,
+                error,
+                None,
+            ));
         }
         None => match run_result.exit_code {
             Some(0) => {
@@ -230,16 +232,20 @@ fn parse_completed(
                         feedback_messages_for_model.push(model_feedback);
                     } else if let Some(invalid_reason) = parsed.invalid_reason {
                         status = HookRunStatus::Failed;
-                        entries.push(HookOutputEntry {
-                            kind: HookOutputEntryKind::Error,
-                            text: invalid_reason,
-                        });
+                        entries.push(common::diagnostic_error_entry(
+                            handler,
+                            &run_result,
+                            invalid_reason,
+                            None,
+                        ));
                     } else if let Some(invalid_block_reason) = parsed.invalid_block_reason {
                         status = HookRunStatus::Failed;
-                        entries.push(HookOutputEntry {
-                            kind: HookOutputEntryKind::Error,
-                            text: invalid_block_reason,
-                        });
+                        entries.push(common::diagnostic_error_entry(
+                            handler,
+                            &run_result,
+                            invalid_block_reason,
+                            None,
+                        ));
                     } else if parsed.should_block {
                         status = HookRunStatus::Blocked;
                         if let Some(reason) = parsed.reason {
@@ -252,10 +258,14 @@ fn parse_completed(
                     }
                 } else if output_parser::looks_like_json(&run_result.stdout) {
                     status = HookRunStatus::Failed;
-                    entries.push(HookOutputEntry {
-                        kind: HookOutputEntryKind::Error,
-                        text: "hook returned invalid post-tool-use JSON output".to_string(),
-                    });
+                    entries.push(common::diagnostic_error_entry(
+                        handler,
+                        &run_result,
+                        "hook returned invalid post-tool-use JSON output",
+                        Some(output_parser::post_tool_use_parse_failure(
+                            &run_result.stdout,
+                        )),
+                    ));
                 }
             }
             Some(2) => {
@@ -267,25 +277,31 @@ fn parse_completed(
                     feedback_messages_for_model.push(reason);
                 } else {
                     status = HookRunStatus::Failed;
-                    entries.push(HookOutputEntry {
-                        kind: HookOutputEntryKind::Error,
-                        text: "PostToolUse hook exited with code 2 but did not write feedback to stderr".to_string(),
-                    });
+                    entries.push(common::diagnostic_error_entry(
+                        handler,
+                        &run_result,
+                        "PostToolUse hook exited with code 2 but did not write feedback to stderr",
+                        None,
+                    ));
                 }
             }
             Some(exit_code) => {
                 status = HookRunStatus::Failed;
-                entries.push(HookOutputEntry {
-                    kind: HookOutputEntryKind::Error,
-                    text: format!("hook exited with code {exit_code}"),
-                });
+                entries.push(common::diagnostic_error_entry(
+                    handler,
+                    &run_result,
+                    format!("hook exited with code {exit_code}"),
+                    None,
+                ));
             }
             None => {
                 status = HookRunStatus::Failed;
-                entries.push(HookOutputEntry {
-                    kind: HookOutputEntryKind::Error,
-                    text: "hook exited without a status code".to_string(),
-                });
+                entries.push(common::diagnostic_error_entry(
+                    handler,
+                    &run_result,
+                    "hook exited without a status code",
+                    None,
+                ));
             }
         },
     }
@@ -425,12 +441,87 @@ mod tests {
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
+        assert_error_contains(
+            &parsed.completed.run.entries,
+            &[
+                "PostToolUse hook returned unsupported updatedMCPToolOutput",
+                "hook_event: PostToolUse",
+                "hook_name_or_id: post-tool-use:0:/tmp/hooks.json",
+                "config_source: User /tmp/hooks.json",
+                "command: python3 post_tool_use_hook.py",
+                "exit_code: 0",
+                "stdout_tail:",
+            ],
+        );
+    }
+
+    #[test]
+    fn nonzero_exit_includes_hook_diagnostics() {
+        let parsed = parse_completed(
+            &handler(),
+            run_result(
+                Some(1),
+                "setup log\nTOKEN=secret-token\nlast stdout line",
+                "first stderr\nAuthorization: Bearer secret\nlast stderr line",
+            ),
+            Some("turn-1".to_string()),
+        );
+
         assert_eq!(
-            parsed.completed.run.entries,
-            vec![HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: "PostToolUse hook returned unsupported updatedMCPToolOutput".to_string(),
-            }]
+            parsed.data,
+            PostToolUseHandlerData {
+                should_stop: false,
+                stop_reason: None,
+                additional_contexts_for_model: Vec::new(),
+                feedback_messages_for_model: Vec::new(),
+            }
+        );
+        assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
+        assert_error_contains(
+            &parsed.completed.run.entries,
+            &[
+                "hook exited with code 1",
+                "hook_event: PostToolUse",
+                "hook_name_or_id: post-tool-use:0:/tmp/hooks.json",
+                "config_source: User /tmp/hooks.json",
+                "command: python3 post_tool_use_hook.py",
+                "exit_code: 1",
+                "stderr_tail:",
+                "Authorization: Bearer <redacted>",
+                "last stderr line",
+                "stdout_tail:",
+                "TOKEN=<redacted>",
+                "last stdout line",
+            ],
+        );
+    }
+
+    #[test]
+    fn mixed_json_and_stdout_logs_are_classified() {
+        let parsed = parse_completed(
+            &handler(),
+            run_result(Some(0), "{\"continue\":true}\nlog after json", ""),
+            Some("turn-1".to_string()),
+        );
+
+        assert_eq!(
+            parsed.data,
+            PostToolUseHandlerData {
+                should_stop: false,
+                stop_reason: None,
+                additional_contexts_for_model: Vec::new(),
+                feedback_messages_for_model: Vec::new(),
+            }
+        );
+        assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
+        assert_error_contains(
+            &parsed.completed.run.entries,
+            &[
+                "hook returned invalid post-tool-use JSON output",
+                "stdout_parse_error: valid JSON followed by non-JSON output",
+                "stdout_tail:",
+                "log after json",
+            ],
         );
     }
 
@@ -569,6 +660,18 @@ mod tests {
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
             error: None,
+        }
+    }
+
+    fn assert_error_contains(entries: &[HookOutputEntry], expected: &[&str]) {
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, HookOutputEntryKind::Error);
+        for text in expected {
+            assert!(
+                entries[0].text.contains(text),
+                "expected error text to contain {text:?}, got:\n{}",
+                entries[0].text
+            );
         }
     }
 

@@ -228,10 +228,12 @@ fn parse_completed(
     match run_result.error.as_deref() {
         Some(error) => {
             status = HookRunStatus::Failed;
-            entries.push(HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: error.to_string(),
-            });
+            entries.push(common::diagnostic_error_entry(
+                handler,
+                &run_result,
+                error,
+                None,
+            ));
         }
         None => match run_result.exit_code {
             Some(0) => {
@@ -277,21 +279,24 @@ fn parse_completed(
                     }
                 } else if output_parser::looks_like_json(&run_result.stdout) {
                     status = HookRunStatus::Failed;
-                    entries.push(HookOutputEntry {
-                        kind: HookOutputEntryKind::Error,
-                        text: match handler.event_name {
-                            HookEventName::SessionStart => {
-                                "hook returned invalid session start JSON output"
-                            }
-                            HookEventName::SubagentStart => {
-                                "hook returned invalid subagent start JSON output"
-                            }
-                            event_name => {
-                                panic!("expected start hook event, got {event_name:?}")
-                            }
+                    let message = match handler.event_name {
+                        HookEventName::SessionStart => {
+                            "hook returned invalid session start JSON output"
                         }
-                        .to_string(),
-                    });
+                        HookEventName::SubagentStart => {
+                            "hook returned invalid subagent start JSON output"
+                        }
+                        event_name => {
+                            panic!("expected start hook event, got {event_name:?}")
+                        }
+                    }
+                    .to_string();
+                    entries.push(common::diagnostic_error_entry(
+                        handler,
+                        &run_result,
+                        message,
+                        Some(start_parse_failure(handler.event_name, &run_result.stdout)),
+                    ));
                 } else {
                     let additional_context = trimmed_stdout.to_string();
                     common::append_additional_context(
@@ -303,17 +308,21 @@ fn parse_completed(
             }
             Some(exit_code) => {
                 status = HookRunStatus::Failed;
-                entries.push(HookOutputEntry {
-                    kind: HookOutputEntryKind::Error,
-                    text: format!("hook exited with code {exit_code}"),
-                });
+                entries.push(common::diagnostic_error_entry(
+                    handler,
+                    &run_result,
+                    format!("hook exited with code {exit_code}"),
+                    None,
+                ));
             }
             None => {
                 status = HookRunStatus::Failed;
-                entries.push(HookOutputEntry {
-                    kind: HookOutputEntryKind::Error,
-                    text: "hook exited without a status code".to_string(),
-                });
+                entries.push(common::diagnostic_error_entry(
+                    handler,
+                    &run_result,
+                    "hook exited without a status code",
+                    None,
+                ));
             }
         },
     }
@@ -331,6 +340,16 @@ fn parse_completed(
             additional_contexts_for_model,
         },
         completion_order: 0,
+    }
+}
+
+fn start_parse_failure(event_name: HookEventName, stdout: &str) -> output_parser::JsonParseFailure {
+    match event_name {
+        HookEventName::SessionStart => output_parser::session_start_parse_failure(stdout),
+        HookEventName::SubagentStart => output_parser::subagent_start_parse_failure(stdout),
+        event_name => {
+            panic!("expected start hook event, got {event_name:?}")
+        }
     }
 }
 
@@ -441,12 +460,18 @@ mod tests {
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
-        assert_eq!(
-            parsed.completed.run.entries,
-            vec![HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: "hook returned invalid session start JSON output".to_string(),
-            }]
+        assert_error_contains(
+            &parsed.completed.run.entries,
+            &[
+                "hook returned invalid session start JSON output",
+                "hook_event: SessionStart",
+                "hook_name_or_id: session-start:0:/tmp/hooks.json",
+                "config_source: User /tmp/hooks.json",
+                "command: echo hook",
+                "exit_code: 0",
+                "stdout_parse_error: invalid JSON stdout:",
+                "stdout_tail:",
+            ],
         );
     }
 
@@ -535,6 +560,18 @@ mod tests {
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
             error: None,
+        }
+    }
+
+    fn assert_error_contains(entries: &[HookOutputEntry], expected: &[&str]) {
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, HookOutputEntryKind::Error);
+        for text in expected {
+            assert!(
+                entries[0].text.contains(text),
+                "expected error text to contain {text:?}, got:\n{}",
+                entries[0].text
+            );
         }
     }
 }

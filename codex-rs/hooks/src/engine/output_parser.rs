@@ -335,24 +335,132 @@ impl From<HookUniversalOutputWire> for UniversalOutput {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JsonParseFailure {
+    Empty,
+    NonJson,
+    InvalidJson(String),
+    MixedJsonAndLogs,
+    ExpectedObject(String),
+    Schema(String),
+}
+
+impl std::fmt::Display for JsonParseFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JsonParseFailure::Empty => write!(f, "empty stdout; expected JSON object"),
+            JsonParseFailure::NonJson => write!(f, "non-JSON stdout; expected JSON object"),
+            JsonParseFailure::InvalidJson(error) => write!(f, "invalid JSON stdout: {error}"),
+            JsonParseFailure::MixedJsonAndLogs => {
+                write!(f, "valid JSON followed by non-JSON output")
+            }
+            JsonParseFailure::ExpectedObject(actual) => {
+                write!(f, "expected JSON object, got {actual}")
+            }
+            JsonParseFailure::Schema(error) => {
+                write!(f, "JSON did not match expected hook output schema: {error}")
+            }
+        }
+    }
+}
+
+pub(crate) fn session_start_parse_failure(stdout: &str) -> JsonParseFailure {
+    parse_json_failure::<SessionStartCommandOutputWire>(stdout)
+}
+
+pub(crate) fn subagent_start_parse_failure(stdout: &str) -> JsonParseFailure {
+    parse_json_failure::<SubagentStartCommandOutputWire>(stdout)
+}
+
+pub(crate) fn pre_tool_use_parse_failure(stdout: &str) -> JsonParseFailure {
+    parse_json_failure::<PreToolUseCommandOutputWire>(stdout)
+}
+
+pub(crate) fn post_tool_use_parse_failure(stdout: &str) -> JsonParseFailure {
+    parse_json_failure::<PostToolUseCommandOutputWire>(stdout)
+}
+
+pub(crate) fn permission_request_parse_failure(stdout: &str) -> JsonParseFailure {
+    parse_json_failure::<PermissionRequestCommandOutputWire>(stdout)
+}
+
+pub(crate) fn pre_compact_parse_failure(stdout: &str) -> JsonParseFailure {
+    parse_json_failure::<PreCompactCommandOutputWire>(stdout)
+}
+
+pub(crate) fn post_compact_parse_failure(stdout: &str) -> JsonParseFailure {
+    parse_json_failure::<PostCompactCommandOutputWire>(stdout)
+}
+
+pub(crate) fn user_prompt_submit_parse_failure(stdout: &str) -> JsonParseFailure {
+    parse_json_failure::<UserPromptSubmitCommandOutputWire>(stdout)
+}
+
+pub(crate) fn stop_parse_failure(stdout: &str) -> JsonParseFailure {
+    parse_json_failure::<StopCommandOutputWire>(stdout)
+}
+
+pub(crate) fn subagent_stop_parse_failure(stdout: &str) -> JsonParseFailure {
+    parse_json_failure::<SubagentStopCommandOutputWire>(stdout)
+}
+
 fn parse_json<T>(stdout: &str) -> Option<T>
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
+    parse_json_detailed(stdout).ok()
+}
+
+fn parse_json_failure<T>(stdout: &str) -> JsonParseFailure
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
+    match parse_json_detailed::<T>(stdout) {
+        Ok(_) => unreachable!("parse_json_failure called after successful parse"),
+        Err(failure) => failure,
+    }
+}
+
+fn parse_json_detailed<T>(stdout: &str) -> Result<T, JsonParseFailure>
 where
     T: for<'de> serde::Deserialize<'de>,
 {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
-        return None;
+        return Err(JsonParseFailure::Empty);
     }
-    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    if !looks_like_json(trimmed) {
+        return Err(JsonParseFailure::NonJson);
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|error| {
+        if error.to_string().contains("trailing characters") {
+            JsonParseFailure::MixedJsonAndLogs
+        } else {
+            JsonParseFailure::InvalidJson(error.to_string())
+        }
+    })?;
     if !value.is_object() {
-        return None;
+        return Err(JsonParseFailure::ExpectedObject(
+            json_kind(&value).to_string(),
+        ));
     }
-    serde_json::from_value(value).ok()
+    serde_json::from_value(value).map_err(|error| JsonParseFailure::Schema(error.to_string()))
 }
 
 pub(crate) fn looks_like_json(stdout: &str) -> bool {
     let trimmed = stdout.trim_start();
     trimmed.starts_with('{') || trimmed.starts_with('[')
+}
+
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 fn invalid_block_message(event_name: &str) -> String {

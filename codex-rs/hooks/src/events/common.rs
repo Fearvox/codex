@@ -4,9 +4,32 @@ use codex_protocol::protocol::HookOutputEntry;
 use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
+use std::sync::LazyLock;
 
 use crate::engine::ConfiguredHandler;
+use crate::engine::command_runner::CommandRunResult;
 use crate::engine::dispatcher;
+use crate::engine::output_parser::JsonParseFailure;
+
+const OUTPUT_TAIL_MAX_LINES: usize = 8;
+const OUTPUT_TAIL_MAX_CHARS: usize = 1_200;
+
+static BEARER_REDACTION_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| redaction_regex("(?i)(authorization:\\s*bearer\\s+)[^\\s]+"));
+static SECRET_ASSIGNMENT_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    redaction_regex(
+        "(?i)\\b([A-Z0-9_]*(?:TOKEN|API[_-]?KEY|SECRET|PASSWORD|AUTH)[A-Z0-9_]*\\s*=\\s*)(\"[^\"]*\"|'[^']*'|[^\\s]+)",
+    )
+});
+static SECRET_FLAG_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| redaction_regex("(?i)(--(?:api-key|token|secret|password)(?:=|\\s+))[^\\s]+"));
+
+fn redaction_regex(pattern: &str) -> regex::Regex {
+    match regex::Regex::new(pattern) {
+        Ok(regex) => regex,
+        Err(error) => panic!("invalid hook diagnostic redaction regex {pattern:?}: {error}"),
+    }
+}
 
 /// Identifies a thread-spawned subagent when a normal hook runs inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +53,108 @@ pub(crate) fn trimmed_non_empty(text: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+pub(crate) fn diagnostic_error_entry(
+    handler: &ConfiguredHandler,
+    run_result: &CommandRunResult,
+    message: impl Into<String>,
+    stdout_parse_error: Option<JsonParseFailure>,
+) -> HookOutputEntry {
+    HookOutputEntry {
+        kind: HookOutputEntryKind::Error,
+        text: diagnostic_error_text(handler, run_result, message.into(), stdout_parse_error),
+    }
+}
+
+fn diagnostic_error_text(
+    handler: &ConfiguredHandler,
+    run_result: &CommandRunResult,
+    message: String,
+    stdout_parse_error: Option<JsonParseFailure>,
+) -> String {
+    let mut lines = vec![
+        message,
+        "hook diagnostics:".to_string(),
+        format!("  hook_event: {:?}", handler.event_name),
+        format!("  hook_name_or_id: {}", redact(&handler.run_id())),
+        format!(
+            "  config_source: {:?} {}",
+            handler.source,
+            redact(&handler.source_path.display().to_string())
+        ),
+        format!("  command: {}", redact(&handler.command)),
+        format!(
+            "  exit_code: {}",
+            run_result
+                .exit_code
+                .map(|exit_code| exit_code.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ),
+    ];
+
+    if let Some(status_message) = handler.status_message.as_deref() {
+        lines.push(format!("  status_message: {}", redact(status_message)));
+    }
+    if let Some(error) = run_result.error.as_deref().and_then(trimmed_non_empty) {
+        lines.push(format!("  process_error: {}", redact(&error)));
+    }
+    if let Some(stdout_parse_error) = stdout_parse_error {
+        lines.push(format!(
+            "  stdout_parse_error: {}",
+            redact(&stdout_parse_error.to_string())
+        ));
+    }
+    if let Some(stderr_tail) = output_tail(&run_result.stderr) {
+        lines.push("  stderr_tail:".to_string());
+        lines.extend(indent_block(&stderr_tail));
+    }
+    if let Some(stdout_tail) = output_tail(&run_result.stdout) {
+        lines.push("  stdout_tail:".to_string());
+        lines.extend(indent_block(&stdout_tail));
+    }
+
+    lines.join("\n")
+}
+
+fn output_tail(output: &str) -> Option<String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut lines = trimmed
+        .lines()
+        .rev()
+        .take(OUTPUT_TAIL_MAX_LINES)
+        .collect::<Vec<_>>();
+    lines.reverse();
+    let redacted = redact(&lines.join("\n"));
+    Some(tail_chars(&redacted, OUTPUT_TAIL_MAX_CHARS))
+}
+
+fn tail_chars(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    let start_byte = text
+        .char_indices()
+        .nth(char_count.saturating_sub(max_chars))
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    format!("...{}", &text[start_byte..])
+}
+
+fn indent_block(text: &str) -> Vec<String> {
+    text.lines().map(|line| format!("    {line}")).collect()
+}
+
+fn redact(text: &str) -> String {
+    let text = BEARER_REDACTION_RE.replace_all(text, "${1}<redacted>");
+    let text = SECRET_ASSIGNMENT_RE.replace_all(&text, "${1}<redacted>");
+    SECRET_FLAG_RE
+        .replace_all(&text, "${1}<redacted>")
+        .to_string()
 }
 
 pub(crate) fn append_additional_context(
@@ -62,13 +187,24 @@ pub(crate) fn serialization_failure_hook_events(
         .into_iter()
         .map(|handler| {
             let mut run = dispatcher::running_summary(&handler);
+            let run_result = CommandRunResult {
+                started_at: run.started_at,
+                completed_at: run.started_at,
+                duration_ms: 0,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: Some(error_message.clone()),
+            };
             run.status = HookRunStatus::Failed;
             run.completed_at = Some(run.started_at);
             run.duration_ms = Some(0);
-            run.entries = vec![HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: error_message.clone(),
-            }];
+            run.entries = vec![diagnostic_error_entry(
+                &handler,
+                &run_result,
+                error_message.clone(),
+                None,
+            )];
             HookCompletedEvent {
                 turn_id: turn_id.clone(),
                 run,

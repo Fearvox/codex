@@ -144,10 +144,12 @@ fn parse_completed(
     match run_result.error.as_deref() {
         Some(error) => {
             status = HookRunStatus::Failed;
-            entries.push(HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: error.to_string(),
-            });
+            entries.push(common::diagnostic_error_entry(
+                handler,
+                &run_result,
+                error,
+                None,
+            ));
         }
         None => match run_result.exit_code {
             Some(0) => {
@@ -184,10 +186,12 @@ fn parse_completed(
                         }
                     } else if let Some(invalid_block_reason) = parsed.invalid_block_reason {
                         status = HookRunStatus::Failed;
-                        entries.push(HookOutputEntry {
-                            kind: HookOutputEntryKind::Error,
-                            text: invalid_block_reason,
-                        });
+                        entries.push(common::diagnostic_error_entry(
+                            handler,
+                            &run_result,
+                            invalid_block_reason,
+                            None,
+                        ));
                     } else if parsed.should_block {
                         status = HookRunStatus::Blocked;
                         should_stop = true;
@@ -201,10 +205,14 @@ fn parse_completed(
                     }
                 } else if output_parser::looks_like_json(&run_result.stdout) {
                     status = HookRunStatus::Failed;
-                    entries.push(HookOutputEntry {
-                        kind: HookOutputEntryKind::Error,
-                        text: "hook returned invalid user prompt submit JSON output".to_string(),
-                    });
+                    entries.push(common::diagnostic_error_entry(
+                        handler,
+                        &run_result,
+                        "hook returned invalid user prompt submit JSON output",
+                        Some(output_parser::user_prompt_submit_parse_failure(
+                            &run_result.stdout,
+                        )),
+                    ));
                 } else {
                     let additional_context = trimmed_stdout.to_string();
                     common::append_additional_context(
@@ -225,25 +233,31 @@ fn parse_completed(
                     });
                 } else {
                     status = HookRunStatus::Failed;
-                    entries.push(HookOutputEntry {
-                        kind: HookOutputEntryKind::Error,
-                        text: "UserPromptSubmit hook exited with code 2 but did not write a blocking reason to stderr".to_string(),
-                    });
+                    entries.push(common::diagnostic_error_entry(
+                        handler,
+                        &run_result,
+                        "UserPromptSubmit hook exited with code 2 but did not write a blocking reason to stderr",
+                        None,
+                    ));
                 }
             }
             Some(exit_code) => {
                 status = HookRunStatus::Failed;
-                entries.push(HookOutputEntry {
-                    kind: HookOutputEntryKind::Error,
-                    text: format!("hook exited with code {exit_code}"),
-                });
+                entries.push(common::diagnostic_error_entry(
+                    handler,
+                    &run_result,
+                    format!("hook exited with code {exit_code}"),
+                    None,
+                ));
             }
             None => {
                 status = HookRunStatus::Failed;
-                entries.push(HookOutputEntry {
-                    kind: HookOutputEntryKind::Error,
-                    text: "hook exited without a status code".to_string(),
-                });
+                entries.push(common::diagnostic_error_entry(
+                    handler,
+                    &run_result,
+                    "hook exited without a status code",
+                    None,
+                ));
             }
         },
     }
@@ -381,13 +395,17 @@ mod tests {
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
-        assert_eq!(
-            parsed.completed.run.entries,
-            vec![HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: "UserPromptSubmit hook returned decision:block without a non-empty reason"
-                    .to_string(),
-            }]
+        assert_error_contains(
+            &parsed.completed.run.entries,
+            &[
+                "UserPromptSubmit hook returned decision:block without a non-empty reason",
+                "hook_event: UserPromptSubmit",
+                "hook_name_or_id: user-prompt-submit:0:/tmp/hooks.json",
+                "config_source: User /tmp/hooks.json",
+                "command: echo hook",
+                "exit_code: 0",
+                "stdout_tail:",
+            ],
         );
     }
 
@@ -440,6 +458,18 @@ mod tests {
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
             error: None,
+        }
+    }
+
+    fn assert_error_contains(entries: &[HookOutputEntry], expected: &[&str]) {
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, HookOutputEntryKind::Error);
+        for text in expected {
+            assert!(
+                entries[0].text.contains(text),
+                "expected error text to contain {text:?}, got:\n{}",
+                entries[0].text
+            );
         }
     }
 }

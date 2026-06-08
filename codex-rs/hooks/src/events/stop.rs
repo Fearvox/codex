@@ -221,10 +221,12 @@ fn parse_completed(
     match run_result.error.as_deref() {
         Some(error) => {
             status = HookRunStatus::Failed;
-            entries.push(HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: error.to_string(),
-            });
+            entries.push(common::diagnostic_error_entry(
+                handler,
+                &run_result,
+                error,
+                None,
+            ));
         }
         None => match run_result.exit_code {
             Some(0) => {
@@ -256,10 +258,12 @@ fn parse_completed(
                         }
                     } else if let Some(invalid_block_reason) = parsed.invalid_block_reason {
                         status = HookRunStatus::Failed;
-                        entries.push(HookOutputEntry {
-                            kind: HookOutputEntryKind::Error,
-                            text: invalid_block_reason,
-                        });
+                        entries.push(common::diagnostic_error_entry(
+                            handler,
+                            &run_result,
+                            invalid_block_reason,
+                            None,
+                        ));
                     } else if parsed.should_block {
                         if let Some(reason) =
                             parsed.reason.as_deref().and_then(common::trimmed_non_empty)
@@ -274,30 +278,36 @@ fn parse_completed(
                             });
                         } else {
                             status = HookRunStatus::Failed;
-                            entries.push(HookOutputEntry {
-                                kind: HookOutputEntryKind::Error,
-                                text: match hook_event_name {
+                            let message = match hook_event_name {
                                     HookEventName::Stop => "Stop hook returned decision:block without a non-empty reason",
                                     HookEventName::SubagentStop => "SubagentStop hook returned decision:block without a non-empty reason",
                                     _ => unreachable!("validated stop hook event"),
                                 }
-                                .to_string(),
-                            });
+                                .to_string();
+                            entries.push(common::diagnostic_error_entry(
+                                handler,
+                                &run_result,
+                                message,
+                                None,
+                            ));
                         }
                     }
                 } else {
                     status = HookRunStatus::Failed;
-                    entries.push(HookOutputEntry {
-                        kind: HookOutputEntryKind::Error,
-                        text: match hook_event_name {
-                            HookEventName::Stop => "hook returned invalid stop hook JSON output",
-                            HookEventName::SubagentStop => {
-                                "hook returned invalid subagent stop hook JSON output"
-                            }
-                            _ => unreachable!("validated stop hook event"),
+                    let message = match hook_event_name {
+                        HookEventName::Stop => "hook returned invalid stop hook JSON output",
+                        HookEventName::SubagentStop => {
+                            "hook returned invalid subagent stop hook JSON output"
                         }
-                        .to_string(),
-                    });
+                        _ => unreachable!("validated stop hook event"),
+                    }
+                    .to_string();
+                    entries.push(common::diagnostic_error_entry(
+                        handler,
+                        &run_result,
+                        message,
+                        Some(stop_parse_failure(hook_event_name, &run_result.stdout)),
+                    ));
                 }
             }
             Some(2) => {
@@ -312,9 +322,7 @@ fn parse_completed(
                     });
                 } else {
                     status = HookRunStatus::Failed;
-                    entries.push(HookOutputEntry {
-                        kind: HookOutputEntryKind::Error,
-                        text: match hook_event_name {
+                    let message = match hook_event_name {
                             HookEventName::Stop => {
                                 "Stop hook exited with code 2 but did not write a continuation prompt to stderr"
                             }
@@ -323,23 +331,32 @@ fn parse_completed(
                             }
                             _ => unreachable!("validated stop hook event"),
                         }
-                        .to_string(),
-                    });
+                        .to_string();
+                    entries.push(common::diagnostic_error_entry(
+                        handler,
+                        &run_result,
+                        message,
+                        None,
+                    ));
                 }
             }
             Some(exit_code) => {
                 status = HookRunStatus::Failed;
-                entries.push(HookOutputEntry {
-                    kind: HookOutputEntryKind::Error,
-                    text: format!("hook exited with code {exit_code}"),
-                });
+                entries.push(common::diagnostic_error_entry(
+                    handler,
+                    &run_result,
+                    format!("hook exited with code {exit_code}"),
+                    None,
+                ));
             }
             None => {
                 status = HookRunStatus::Failed;
-                entries.push(HookOutputEntry {
-                    kind: HookOutputEntryKind::Error,
-                    text: "hook exited without a status code".to_string(),
-                });
+                entries.push(common::diagnostic_error_entry(
+                    handler,
+                    &run_result,
+                    "hook exited without a status code",
+                    None,
+                ));
             }
         },
     }
@@ -367,6 +384,14 @@ fn parse_completed(
             continuation_fragments,
         },
         completion_order: 0,
+    }
+}
+
+fn stop_parse_failure(event_name: HookEventName, stdout: &str) -> output_parser::JsonParseFailure {
+    match event_name {
+        HookEventName::Stop => output_parser::stop_parse_failure(stdout),
+        HookEventName::SubagentStop => output_parser::subagent_stop_parse_failure(stdout),
+        _ => unreachable!("validated stop hook event"),
     }
 }
 
@@ -473,12 +498,14 @@ mod tests {
 
         assert_eq!(parsed.data, StopHandlerData::default());
         assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
-        assert_eq!(
-            parsed.completed.run.entries,
-            vec![HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: "Stop hook returned decision:block without a non-empty reason".to_string(),
-            }]
+        assert_error_contains(
+            &parsed.completed.run.entries,
+            &[
+                "Stop hook returned decision:block without a non-empty reason",
+                "hook_event: Stop",
+                "exit_code: 0",
+                "stdout_tail:",
+            ],
         );
     }
 
@@ -541,14 +568,16 @@ mod tests {
 
         assert_eq!(parsed.data, StopHandlerData::default());
         assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
-        assert_eq!(
-            parsed.completed.run.entries,
-            vec![HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text:
-                    "Stop hook exited with code 2 but did not write a continuation prompt to stderr"
-                        .to_string(),
-            }]
+        assert_error_contains(
+            &parsed.completed.run.entries,
+            &[
+                "Stop hook exited with code 2 but did not write a continuation prompt to stderr",
+                "hook_event: Stop",
+                "hook_name_or_id: stop:0:/tmp/hooks.json",
+                "config_source: User /tmp/hooks.json",
+                "command: echo hook",
+                "exit_code: 2",
+            ],
         );
     }
 
@@ -562,12 +591,14 @@ mod tests {
 
         assert_eq!(parsed.data, StopHandlerData::default());
         assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
-        assert_eq!(
-            parsed.completed.run.entries,
-            vec![HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: "Stop hook returned decision:block without a non-empty reason".to_string(),
-            }]
+        assert_error_contains(
+            &parsed.completed.run.entries,
+            &[
+                "Stop hook returned decision:block without a non-empty reason",
+                "hook_event: Stop",
+                "exit_code: 0",
+                "stdout_tail:",
+            ],
         );
     }
 
@@ -581,12 +612,14 @@ mod tests {
 
         assert_eq!(parsed.data, StopHandlerData::default());
         assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
-        assert_eq!(
-            parsed.completed.run.entries,
-            vec![HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: "hook returned invalid stop hook JSON output".to_string(),
-            }]
+        assert_error_contains(
+            &parsed.completed.run.entries,
+            &[
+                "hook returned invalid stop hook JSON output",
+                "stdout_parse_error: non-JSON stdout; expected JSON object",
+                "stdout_tail:",
+                "not json",
+            ],
         );
     }
 
@@ -651,6 +684,18 @@ mod tests {
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
             error: None,
+        }
+    }
+
+    fn assert_error_contains(entries: &[HookOutputEntry], expected: &[&str]) {
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, HookOutputEntryKind::Error);
+        for text in expected {
+            assert!(
+                entries[0].text.contains(text),
+                "expected error text to contain {text:?}, got:\n{}",
+                entries[0].text
+            );
         }
     }
 }

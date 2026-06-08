@@ -238,10 +238,12 @@ fn parse_pre_completed(
     match run_result.error.as_deref() {
         Some(error) => {
             status = HookRunStatus::Failed;
-            entries.push(HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: error.to_string(),
-            });
+            entries.push(common::diagnostic_error_entry(
+                handler,
+                &run_result,
+                error,
+                None,
+            ));
         }
         None => match run_result.exit_code {
             Some(0) => {
@@ -268,33 +270,40 @@ fn parse_pre_completed(
                         });
                     } else if let Some(invalid_reason) = parsed.invalid_reason {
                         status = HookRunStatus::Failed;
-                        entries.push(HookOutputEntry {
-                            kind: HookOutputEntryKind::Error,
-                            text: invalid_reason,
-                        });
+                        entries.push(common::diagnostic_error_entry(
+                            handler,
+                            &run_result,
+                            invalid_reason,
+                            None,
+                        ));
                     }
                 } else if output_parser::looks_like_json(&run_result.stdout) {
                     status = HookRunStatus::Failed;
-                    entries.push(HookOutputEntry {
-                        kind: HookOutputEntryKind::Error,
-                        text: "hook returned invalid PreCompact hook JSON output".to_string(),
-                    });
+                    entries.push(common::diagnostic_error_entry(
+                        handler,
+                        &run_result,
+                        "hook returned invalid PreCompact hook JSON output",
+                        Some(output_parser::pre_compact_parse_failure(&run_result.stdout)),
+                    ));
                 }
             }
             Some(code) => {
                 status = HookRunStatus::Failed;
-                entries.push(HookOutputEntry {
-                    kind: HookOutputEntryKind::Error,
-                    text: common::trimmed_non_empty(&run_result.stderr)
-                        .unwrap_or_else(|| format!("hook exited with code {code}")),
-                });
+                entries.push(common::diagnostic_error_entry(
+                    handler,
+                    &run_result,
+                    format!("hook exited with code {code}"),
+                    None,
+                ));
             }
             None => {
                 status = HookRunStatus::Failed;
-                entries.push(HookOutputEntry {
-                    kind: HookOutputEntryKind::Error,
-                    text: "hook process terminated without an exit code".to_string(),
-                });
+                entries.push(common::diagnostic_error_entry(
+                    handler,
+                    &run_result,
+                    "hook process terminated without an exit code",
+                    None,
+                ));
             }
         },
     }
@@ -323,6 +332,7 @@ fn parse_post_completed(
         turn_id,
         "PostCompact",
         output_parser::parse_post_compact,
+        output_parser::post_compact_parse_failure,
     )
 }
 
@@ -332,6 +342,7 @@ fn parse_completed(
     turn_id: Option<String>,
     event_label: &'static str,
     parse_output: fn(&str) -> Option<output_parser::StatelessHookOutput>,
+    parse_failure: fn(&str) -> output_parser::JsonParseFailure,
 ) -> dispatcher::ParsedHandler<CompactHandlerData> {
     let mut entries = Vec::new();
     let mut status = HookRunStatus::Completed;
@@ -341,10 +352,12 @@ fn parse_completed(
     match run_result.error.as_deref() {
         Some(error) => {
             status = HookRunStatus::Failed;
-            entries.push(HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: error.to_string(),
-            });
+            entries.push(common::diagnostic_error_entry(
+                handler,
+                &run_result,
+                error,
+                None,
+            ));
         }
         None => match run_result.exit_code {
             Some(0) => {
@@ -371,33 +384,40 @@ fn parse_completed(
                         });
                     } else if let Some(invalid_reason) = parsed.invalid_reason {
                         status = HookRunStatus::Failed;
-                        entries.push(HookOutputEntry {
-                            kind: HookOutputEntryKind::Error,
-                            text: invalid_reason,
-                        });
+                        entries.push(common::diagnostic_error_entry(
+                            handler,
+                            &run_result,
+                            invalid_reason,
+                            None,
+                        ));
                     }
                 } else if output_parser::looks_like_json(&run_result.stdout) {
                     status = HookRunStatus::Failed;
-                    entries.push(HookOutputEntry {
-                        kind: HookOutputEntryKind::Error,
-                        text: format!("hook returned invalid {event_label} hook JSON output"),
-                    });
+                    entries.push(common::diagnostic_error_entry(
+                        handler,
+                        &run_result,
+                        format!("hook returned invalid {event_label} hook JSON output"),
+                        Some(parse_failure(&run_result.stdout)),
+                    ));
                 }
             }
             Some(code) => {
                 status = HookRunStatus::Failed;
-                entries.push(HookOutputEntry {
-                    kind: HookOutputEntryKind::Error,
-                    text: common::trimmed_non_empty(&run_result.stderr)
-                        .unwrap_or_else(|| format!("hook exited with code {code}")),
-                });
+                entries.push(common::diagnostic_error_entry(
+                    handler,
+                    &run_result,
+                    format!("hook exited with code {code}"),
+                    None,
+                ));
             }
             None => {
                 status = HookRunStatus::Failed;
-                entries.push(HookOutputEntry {
-                    kind: HookOutputEntryKind::Error,
-                    text: "hook process terminated without an exit code".to_string(),
-                });
+                entries.push(common::diagnostic_error_entry(
+                    handler,
+                    &run_result,
+                    "hook process terminated without an exit code",
+                    None,
+                ));
             }
         },
     }
@@ -487,12 +507,19 @@ mod tests {
         );
 
         assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
-        assert_eq!(
-            parsed.completed.run.entries,
-            vec![HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: "hook returned invalid PreCompact hook JSON output".to_string(),
-            }]
+        assert_error_contains(
+            &parsed.completed.run.entries,
+            &[
+                "hook returned invalid PreCompact hook JSON output",
+                "hook_event: PreCompact",
+                "hook_name_or_id: pre-compact:0:/tmp/hooks.json",
+                "config_source: User /tmp/hooks.json",
+                "command: python3 compact_hook.py",
+                "exit_code: 0",
+                "stdout_parse_error: JSON did not match expected hook output schema:",
+                "unknown field `decision`",
+                "stdout_tail:",
+            ],
         );
     }
 
@@ -616,6 +643,18 @@ mod tests {
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
             error: None,
+        }
+    }
+
+    fn assert_error_contains(entries: &[HookOutputEntry], expected: &[&str]) {
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, HookOutputEntryKind::Error);
+        for text in expected {
+            assert!(
+                entries[0].text.contains(text),
+                "expected error text to contain {text:?}, got:\n{}",
+                entries[0].text
+            );
         }
     }
 }
