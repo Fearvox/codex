@@ -198,10 +198,12 @@ fn parse_completed(
     match run_result.error.as_deref() {
         Some(error) => {
             status = HookRunStatus::Failed;
-            entries.push(HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: error.to_string(),
-            });
+            entries.push(common::diagnostic_error_entry(
+                handler,
+                &run_result,
+                error,
+                None,
+            ));
         }
         None => match run_result.exit_code {
             Some(0) => {
@@ -218,10 +220,12 @@ fn parse_completed(
                     }
                     if let Some(invalid_reason) = parsed.invalid_reason {
                         status = HookRunStatus::Failed;
-                        entries.push(HookOutputEntry {
-                            kind: HookOutputEntryKind::Error,
-                            text: invalid_reason,
-                        });
+                        entries.push(common::diagnostic_error_entry(
+                            handler,
+                            &run_result,
+                            invalid_reason,
+                            None,
+                        ));
                     } else if let Some(parsed_decision) = parsed.decision {
                         match parsed_decision {
                             output_parser::PermissionRequestDecision::Allow => {
@@ -239,10 +243,14 @@ fn parse_completed(
                     }
                 } else if output_parser::looks_like_json(&run_result.stdout) {
                     status = HookRunStatus::Failed;
-                    entries.push(HookOutputEntry {
-                        kind: HookOutputEntryKind::Error,
-                        text: "hook returned invalid permission-request JSON output".to_string(),
-                    });
+                    entries.push(common::diagnostic_error_entry(
+                        handler,
+                        &run_result,
+                        "hook returned invalid permission-request JSON output",
+                        Some(output_parser::permission_request_parse_failure(
+                            &run_result.stdout,
+                        )),
+                    ));
                 }
             }
             Some(2) => {
@@ -255,25 +263,31 @@ fn parse_completed(
                     decision = Some(PermissionRequestDecision::Deny { message });
                 } else {
                     status = HookRunStatus::Failed;
-                    entries.push(HookOutputEntry {
-                        kind: HookOutputEntryKind::Error,
-                        text: "PermissionRequest hook exited with code 2 but did not write a denial reason to stderr".to_string(),
-                    });
+                    entries.push(common::diagnostic_error_entry(
+                        handler,
+                        &run_result,
+                        "PermissionRequest hook exited with code 2 but did not write a denial reason to stderr",
+                        None,
+                    ));
                 }
             }
             Some(exit_code) => {
                 status = HookRunStatus::Failed;
-                entries.push(HookOutputEntry {
-                    kind: HookOutputEntryKind::Error,
-                    text: format!("hook exited with code {exit_code}"),
-                });
+                entries.push(common::diagnostic_error_entry(
+                    handler,
+                    &run_result,
+                    format!("hook exited with code {exit_code}"),
+                    None,
+                ));
             }
             None => {
                 status = HookRunStatus::Failed;
-                entries.push(HookOutputEntry {
-                    kind: HookOutputEntryKind::Error,
-                    text: "hook exited without a status code".to_string(),
-                });
+                entries.push(common::diagnostic_error_entry(
+                    handler,
+                    &run_result,
+                    "hook exited without a status code",
+                    None,
+                ));
             }
         },
     }

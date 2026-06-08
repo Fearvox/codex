@@ -200,10 +200,12 @@ fn parse_completed(
     match run_result.error.as_deref() {
         Some(error) => {
             status = HookRunStatus::Failed;
-            entries.push(HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: error.to_string(),
-            });
+            entries.push(common::diagnostic_error_entry(
+                handler,
+                &run_result,
+                error,
+                None,
+            ));
         }
         None => match run_result.exit_code {
             Some(0) => {
@@ -218,10 +220,12 @@ fn parse_completed(
                     }
                     if let Some(invalid_reason) = parsed.invalid_reason {
                         status = HookRunStatus::Failed;
-                        entries.push(HookOutputEntry {
-                            kind: HookOutputEntryKind::Error,
-                            text: invalid_reason,
-                        });
+                        entries.push(common::diagnostic_error_entry(
+                            handler,
+                            &run_result,
+                            invalid_reason,
+                            None,
+                        ));
                     } else {
                         if let Some(additional_context) = parsed.additional_context {
                             common::append_additional_context(
@@ -245,10 +249,14 @@ fn parse_completed(
                     }
                 } else if output_parser::looks_like_json(&run_result.stdout) {
                     status = HookRunStatus::Failed;
-                    entries.push(HookOutputEntry {
-                        kind: HookOutputEntryKind::Error,
-                        text: "hook returned invalid pre-tool-use JSON output".to_string(),
-                    });
+                    entries.push(common::diagnostic_error_entry(
+                        handler,
+                        &run_result,
+                        "hook returned invalid pre-tool-use JSON output",
+                        Some(output_parser::pre_tool_use_parse_failure(
+                            &run_result.stdout,
+                        )),
+                    ));
                 }
             }
             Some(2) => {
@@ -262,25 +270,31 @@ fn parse_completed(
                     });
                 } else {
                     status = HookRunStatus::Failed;
-                    entries.push(HookOutputEntry {
-                        kind: HookOutputEntryKind::Error,
-                        text: "PreToolUse hook exited with code 2 but did not write a blocking reason to stderr".to_string(),
-                    });
+                    entries.push(common::diagnostic_error_entry(
+                        handler,
+                        &run_result,
+                        "PreToolUse hook exited with code 2 but did not write a blocking reason to stderr",
+                        None,
+                    ));
                 }
             }
             Some(exit_code) => {
                 status = HookRunStatus::Failed;
-                entries.push(HookOutputEntry {
-                    kind: HookOutputEntryKind::Error,
-                    text: format!("hook exited with code {exit_code}"),
-                });
+                entries.push(common::diagnostic_error_entry(
+                    handler,
+                    &run_result,
+                    format!("hook exited with code {exit_code}"),
+                    None,
+                ));
             }
             None => {
                 status = HookRunStatus::Failed;
-                entries.push(HookOutputEntry {
-                    kind: HookOutputEntryKind::Error,
-                    text: "hook exited without a status code".to_string(),
-                });
+                entries.push(common::diagnostic_error_entry(
+                    handler,
+                    &run_result,
+                    "hook exited without a status code",
+                    None,
+                ));
             }
         },
     }
@@ -451,12 +465,16 @@ mod tests {
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
-        assert_eq!(
-            parsed.completed.run.entries,
-            vec![HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: "PreToolUse hook returned unsupported permissionDecision:allow".to_string(),
-            }]
+        assert_error_contains(
+            &parsed.completed.run.entries,
+            &[
+                "PreToolUse hook returned unsupported permissionDecision:allow",
+                "hook_event: PreToolUse",
+                "hook_name_or_id: pre-tool-use:0:/tmp/hooks.json",
+                "config_source: User /tmp/hooks.json",
+                "command: echo hook",
+                "exit_code: 0",
+            ],
         );
     }
 
@@ -550,12 +568,13 @@ mod tests {
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
-        assert_eq!(
-            parsed.completed.run.entries,
-            vec![HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: "PreToolUse hook returned unsupported permissionDecision:ask".to_string(),
-            }]
+        assert_error_contains(
+            &parsed.completed.run.entries,
+            &[
+                "PreToolUse hook returned unsupported permissionDecision:ask",
+                "hook_event: PreToolUse",
+                "exit_code: 0",
+            ],
         );
     }
 
@@ -577,12 +596,13 @@ mod tests {
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
-        assert_eq!(
-            parsed.completed.run.entries,
-            vec![HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: "PreToolUse hook returned unsupported decision:approve".to_string(),
-            }]
+        assert_error_contains(
+            &parsed.completed.run.entries,
+            &[
+                "PreToolUse hook returned unsupported decision:approve",
+                "hook_event: PreToolUse",
+                "exit_code: 0",
+            ],
         );
     }
 
@@ -662,12 +682,13 @@ mod tests {
             }
         );
         assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
-        assert_eq!(
-            parsed.completed.run.entries,
-            vec![HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: "hook returned invalid pre-tool-use JSON output".to_string(),
-            }]
+        assert_error_contains(
+            &parsed.completed.run.entries,
+            &[
+                "hook returned invalid pre-tool-use JSON output",
+                "stdout_parse_error: invalid JSON stdout:",
+                "stdout_tail:",
+            ],
         );
     }
 
@@ -777,6 +798,18 @@ mod tests {
             matcher_aliases: Vec::new(),
             tool_use_id: tool_use_id.to_string(),
             tool_input: serde_json::json!({ "command": "echo hello" }),
+        }
+    }
+
+    fn assert_error_contains(entries: &[HookOutputEntry], expected: &[&str]) {
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, HookOutputEntryKind::Error);
+        for text in expected {
+            assert!(
+                entries[0].text.contains(text),
+                "expected error text to contain {text:?}, got:\n{}",
+                entries[0].text
+            );
         }
     }
 }
